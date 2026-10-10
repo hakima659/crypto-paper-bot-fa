@@ -30,7 +30,9 @@ async function getPrice() {
   );
 
   if (!res.ok) {
-    throw new Error(`Nobitex price request failed (${res.status})`);
+    throw new Error(
+      `Nobitex price request failed (${res.status})`
+    );
   }
 
   const data = await res.json();
@@ -77,8 +79,11 @@ async function saveState(kv, state) {
 }
 
 async function tick(kv) {
-  if (!kv || typeof kv.get !== "function" ||
-      typeof kv.put !== "function") {
+  if (
+    !kv ||
+    typeof kv.get !== "function" ||
+    typeof kv.put !== "function"
+  ) {
     throw new Error(
       "Configure the BOT_STATE KV binding in Cloudflare."
     );
@@ -117,9 +122,7 @@ async function tick(kv) {
 
     let reason = null;
 
-    if (
-      price <= pos.entry * (1 - CONFIG.stopLossPct)
-    ) {
+    if (price <= pos.entry * (1 - CONFIG.stopLossPct)) {
       reason = "STOP_LOSS";
     } else if (
       price >= pos.entry * (1 + CONFIG.takeProfitPct)
@@ -235,7 +238,8 @@ export default {
         takeProfitPct: CONFIG.takeProfitPct,
         stopLossPct: CONFIG.stopLossPct,
         endpoints: ["/status", "/price", "/tick"],
-        note: "Paper trading only. No real orders or wallet connection."
+        note:
+          "Paper trading only. No real orders or wallet connection."
       });
     }
 
@@ -253,7 +257,8 @@ export default {
     if (!env.BOT_STATE) {
       return json({
         ok: false,
-        error: "Configure the BOT_STATE KV binding in Cloudflare."
+        error:
+          "Configure the BOT_STATE KV binding in Cloudflare."
       }, 500);
     }
 
@@ -294,21 +299,22 @@ export default {
       ok: false,
       error: "Not found"
     }, 404);
-  },
-
-  async scheduled(event, env, ctx) {
-    if (!env.BOT_STATE) {
-      console.error("BOT_STATE KV binding is missing.");
-      return;
-    }
-
-    ctx.waitUntil(
-      tick(env.BOT_STATE).catch((error) => {
-        console.error(
-          "Scheduled paper-trading tick failed:",
-          error.message
-        );
-      })
-    );
   }
 };
+
+// Export the scheduled handler independently.
+export async function scheduled(controller, env, ctx) {
+  if (!env.BOT_STATE) {
+    console.error("BOT_STATE KV binding is missing.");
+    return;
+  }
+
+  ctx.waitUntil(
+    tick(env.BOT_STATE).catch((error) => {
+      console.error(
+        "Scheduled paper-trading tick failed:",
+        error.message
+      );
+    })
+  );
+}
