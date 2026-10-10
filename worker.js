@@ -1,4 +1,3 @@
-
 const CONFIG = {
   initialBalance: 1000,
   tradeAmount: 100,
@@ -23,10 +22,20 @@ function json(data, status = 200) {
   });
 }
 
+function errorMessage(error) {
+  return error instanceof Error
+    ? error.message
+    : String(error);
+}
+
 async function getPrice() {
   const res = await fetch(
     "https://apiv2.nobitex.ir/v3/orderbook/BTCIRT",
-    { headers: { accept: "application/json" } }
+    {
+      headers: {
+        accept: "application/json"
+      }
+    }
   );
 
   if (!res.ok) {
@@ -36,11 +45,17 @@ async function getPrice() {
   }
 
   const data = await res.json();
+
   const bid = Number(data.bids?.[0]?.[0]);
   const ask = Number(data.asks?.[0]?.[0]);
 
-  if (!(bid > 0 && ask > 0) || ask < bid) {
-    throw new Error("Invalid market price from Nobitex");
+  if (
+    !(bid > 0 && ask > 0) ||
+    ask < bid
+  ) {
+    throw new Error(
+      "Invalid market price from Nobitex"
+    );
   }
 
   return {
@@ -53,10 +68,14 @@ async function getPrice() {
 function average(values, period) {
   const sample = values.slice(-period);
 
-  if (sample.length < period) return null;
+  if (sample.length < period) {
+    return null;
+  }
 
-  return sample.reduce((sum, value) => sum + value, 0)
-    / sample.length;
+  return sample.reduce(
+    (sum, value) => sum + value,
+    0
+  ) / sample.length;
 }
 
 function initialState() {
@@ -71,11 +90,16 @@ function initialState() {
 }
 
 async function loadState(kv) {
-  return (await kv.get(KEY, "json")) || initialState();
+  return (
+    await kv.get(KEY, "json")
+  ) || initialState();
 }
 
 async function saveState(kv, state) {
-  await kv.put(KEY, JSON.stringify(state));
+  await kv.put(
+    KEY,
+    JSON.stringify(state)
+  );
 }
 
 async function tick(kv) {
@@ -94,9 +118,19 @@ async function tick(kv) {
   const price = market.price;
   const now = new Date().toISOString();
 
+  if (!Array.isArray(state.prices)) {
+    state.prices = [];
+  }
+
+  if (!Array.isArray(state.trades)) {
+    state.trades = [];
+  }
+
   state.prices.push(price);
 
-  if (state.prices.length > CONFIG.maxPrices) {
+  if (
+    state.prices.length > CONFIG.maxPrices
+  ) {
     state.prices.shift();
   }
 
@@ -108,24 +142,31 @@ async function tick(kv) {
       price
     );
 
+    const profitRatio =
+      (price - pos.entry) / pos.entry;
+
     if (
-      (price - pos.entry) / pos.entry >=
-      CONFIG.trailingStartPct
+      profitRatio >= CONFIG.trailingStartPct
     ) {
       pos.trailingActive = true;
 
       pos.trailingStop = Math.max(
         Number(pos.trailingStop || 0),
-        pos.highest * (1 - CONFIG.trailingDistancePct)
+        pos.highest *
+          (1 - CONFIG.trailingDistancePct)
       );
     }
 
     let reason = null;
 
-    if (price <= pos.entry * (1 - CONFIG.stopLossPct)) {
+    if (
+      price <=
+      pos.entry * (1 - CONFIG.stopLossPct)
+    ) {
       reason = "STOP_LOSS";
     } else if (
-      price >= pos.entry * (1 + CONFIG.takeProfitPct)
+      price >=
+      pos.entry * (1 + CONFIG.takeProfitPct)
     ) {
       reason = "TAKE_PROFIT";
     } else if (
@@ -140,15 +181,22 @@ async function tick(kv) {
         (price - pos.entry) * pos.quantity;
 
       const entryFee =
-        pos.entry * pos.quantity * CONFIG.feePct;
+        pos.entry *
+        pos.quantity *
+        CONFIG.feePct;
 
       const exitFee =
-        price * pos.quantity * CONFIG.feePct;
+        price *
+        pos.quantity *
+        CONFIG.feePct;
 
-      const net = gross - entryFee - exitFee;
+      const net =
+        gross - entryFee - exitFee;
 
       state.balance +=
-        price * pos.quantity * (1 - CONFIG.feePct);
+        price *
+        pos.quantity *
+        (1 - CONFIG.feePct);
 
       state.trades.push({
         entry: pos.entry,
@@ -162,19 +210,26 @@ async function tick(kv) {
         closedAt: now
       });
 
-      if (state.trades.length > CONFIG.maxTrades) {
+      if (
+        state.trades.length > CONFIG.maxTrades
+      ) {
         state.trades.shift();
       }
 
       state.position = null;
     }
   } else if (state.prices.length >= 21) {
-    const previous = state.prices.slice(0, -1);
+    const previous =
+      state.prices.slice(0, -1);
 
     const prevFast = average(previous, 5);
     const prevSlow = average(previous, 20);
-    const currentFast = average(state.prices, 5);
-    const currentSlow = average(state.prices, 20);
+
+    const currentFast =
+      average(state.prices, 5);
+
+    const currentSlow =
+      average(state.prices, 20);
 
     const crossedUp =
       prevFast !== null &&
@@ -237,7 +292,11 @@ export default {
         symbol: "BTC/IRT",
         takeProfitPct: CONFIG.takeProfitPct,
         stopLossPct: CONFIG.stopLossPct,
-        endpoints: ["/status", "/price", "/tick"],
+        endpoints: [
+          "/status",
+          "/price",
+          "/tick"
+        ],
         note:
           "Paper trading only. No real orders or wallet connection."
       });
@@ -249,7 +308,7 @@ export default {
       } catch (error) {
         return json({
           ok: false,
-          error: error.message
+          error: errorMessage(error)
         }, 502);
       }
     }
@@ -264,7 +323,8 @@ export default {
 
     if (url.pathname === "/status") {
       try {
-        const state = await loadState(env.BOT_STATE);
+        const state =
+          await loadState(env.BOT_STATE);
 
         return json({
           ok: true,
@@ -279,18 +339,20 @@ export default {
       } catch (error) {
         return json({
           ok: false,
-          error: error.message
+          error: errorMessage(error)
         }, 500);
       }
     }
 
     if (url.pathname === "/tick") {
       try {
-        return json(await tick(env.BOT_STATE));
+        return json(
+          await tick(env.BOT_STATE)
+        );
       } catch (error) {
         return json({
           ok: false,
-          error: error.message
+          error: errorMessage(error)
         }, 502);
       }
     }
@@ -299,22 +361,49 @@ export default {
       ok: false,
       error: "Not found"
     }, 404);
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          if (!env.BOT_STATE) {
+            throw new Error(
+              "BOT_STATE KV binding is missing."
+            );
+          }
+
+          await tick(env.BOT_STATE);
+        } catch (error) {
+          const message = errorMessage(error);
+
+          console.error(
+            "Scheduled paper-trading tick failed:",
+            message
+          );
+
+          if (env.BOT_STATE) {
+            try {
+              const state =
+                await loadState(env.BOT_STATE);
+
+              state.lastError = message;
+
+              await saveState(
+                env.BOT_STATE,
+                state
+              );
+            } catch (saveError) {
+              console.error(
+                "Could not save scheduled error:",
+                errorMessage(saveError)
+              );
+            }
+          }
+
+          throw error;
+        }
+      })()
+    );
   }
 };
-
-// Export the scheduled handler independently.
-export async function scheduled(controller, env, ctx) {
-  if (!env.BOT_STATE) {
-    console.error("BOT_STATE KV binding is missing.");
-    return;
-  }
-
-  ctx.waitUntil(
-    tick(env.BOT_STATE).catch((error) => {
-      console.error(
-        "Scheduled paper-trading tick failed:",
-        error.message
-      );
-    })
-  );
-}
