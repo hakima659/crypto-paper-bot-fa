@@ -1,4 +1,3 @@
-
 const CONFIG = {
   initialBalance: 1000,
   tradeAmount: 100,
@@ -7,23 +6,25 @@ const CONFIG = {
   stopLossPct: 0.005,
   takeProfitPct: 0.012,
 
-  // Protect gains after price moves in our favor
+  // Profit protection
   breakEvenTriggerPct: 0.0045,
   trailingStartPct: 0.006,
   trailingDistancePct: 0.002,
   breakEvenBufferPct: 0.001,
 
+  // Estimated fee per side
   feePct: 0.001,
 
-  // A wider spread permits more tests but increases trading costs.
-  maxSpreadPct: 0.0035,
+  // Avoid entries when trading costs are too high
+  maxSpreadPct: 0.0015,
 
   minTrendStrengthPct: 0.0003,
   cooldownMinutesAfterLoss: 5,
 
-  // Exit early only after a minimum hold and bearish confirmation.
+  // Early exit after confirmed bearish movement
   earlyExitMinHoldMinutes: 3,
   earlyExitNetLossPct: 0.20,
+  earlyExitMinNetProfitPct: 0.05,
 
   maxPrices: 100,
   maxTrades: 100
@@ -48,7 +49,10 @@ function errorMessage(error) {
 async function getPrice() {
   const response = await fetch(
     "https://apiv2.nobitex.ir/v3/orderbook/BTCIRT",
-    { headers: { accept: "application/json" } }
+    {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(10000)
+    }
   );
 
   if (!response.ok) {
@@ -139,14 +143,16 @@ function estimateNet(position, exitPrice) {
     gross,
     fees,
     net,
-    netPct: notional > 0 ? net / notional * 100 : 0
+    netPct: notional > 0 ? (net / notional) * 100 : 0
   };
 }
 
 function feeAwareBreakEven(entry) {
-  return entry *
+  return (
+    entry *
     ((1 + CONFIG.feePct) / (1 - CONFIG.feePct)) *
-    (1 + CONFIG.breakEvenBufferPct);
+    (1 + CONFIG.breakEvenBufferPct)
+  );
 }
 
 function getRiskInfo(position) {
@@ -189,13 +195,11 @@ function hasBearishConfirmation(prices) {
     return false;
   }
 
-  // Require both a bearish average relationship and
-  // a recent downward move instead of reacting to one tick.
-  const bearishTrend = fast < slow;
-  const priceBelowSlow = prices[prices.length - 1] < slow;
-  const downwardMomentum = recent[4] < recent[0];
-
-  return bearishTrend && priceBelowSlow && downwardMomentum;
+  return (
+    fast < slow &&
+    prices[prices.length - 1] < slow &&
+    recent[4] < recent[0]
+  );
 }
 
 async function tick(kv) {
@@ -240,7 +244,7 @@ async function tick(kv) {
     const highProfit =
       (pos.highest - pos.entry) / pos.entry;
 
-    // Move the protective stop above fee-aware break-even.
+    // Lock a fee-adjusted break-even level after a favorable move.
     if (highProfit >= CONFIG.breakEvenTriggerPct) {
       pos.trailingStop = Math.max(
         pos.trailingStop,
@@ -249,8 +253,7 @@ async function tick(kv) {
       pos.breakEvenProtected = true;
     }
 
-    // Trail upward as the market makes new highs.
-    // The stop is never lowered.
+    // Trailing stop only moves upward, never downward.
     if (highProfit >= CONFIG.trailingStartPct) {
       pos.trailingActive = true;
       pos.trailingStop = Math.max(
@@ -260,8 +263,8 @@ async function tick(kv) {
     }
 
     const resultAtBid = estimateNet(pos, market.bid);
-    const heldMs = Date.parse(nowIso) -
-      Date.parse(pos.openedAt || nowIso);
+    const openedAtMs = Date.parse(pos.openedAt || nowIso);
+    const heldMs = nowMs - openedAtMs;
 
     const minimumHoldPassed =
       Number.isFinite(heldMs) &&
@@ -272,15 +275,12 @@ async function tick(kv) {
 
     let reason = null;
 
-    // Emergency protection takes priority.
     if (
-      market.bid <=
-      pos.entry * (1 - CONFIG.stopLossPct)
+      market.bid <= pos.entry * (1 - CONFIG.stopLossPct)
     ) {
       reason = "EMERGENCY_STOP_LOSS";
     } else if (
-      market.bid >=
-      pos.entry * (1 + CONFIG.takeProfitPct)
+      market.bid >= pos.entry * (1 + CONFIG.takeProfitPct)
     ) {
       reason = "TAKE_PROFIT";
     } else if (
@@ -294,11 +294,17 @@ async function tick(kv) {
       minimumHoldPassed &&
       bearishConfirmed &&
       resultAtBid &&
-      resultAtBid.netPct <= -CONFIG.earlyExitNetLossPct
+      (
+        resultAtBid.netPct <= -CONFIG.earlyExitNetLossPct ||
+        resultAtBid.netPct >= CONFIG.earlyExitMinNetProfitPct
+      )
     ) {
-      // Close only when the bearish trend is confirmed
-      // and estimated net loss has crossed the configured threshold.
-      reason = "EARLY_BEARISH_EXIT";
+      // On confirmed bearish movement, protect a small net profit
+      // or exit when the configured net-loss threshold is reached.
+      reason = resultAtBid.netPct >=
+        CONFIG.earlyExitMinNetProfitPct
+        ? "EARLY_BEARISH_PROFIT_EXIT"
+        : "EARLY_BEARISH_EXIT";
     }
 
     if (reason) {
@@ -307,6 +313,7 @@ async function tick(kv) {
       const exitFee =
         exitPrice * pos.quantity * CONFIG.feePct;
 
+      // Preserve the existing accounting model.
       state.balance +=
         exitPrice * pos.quantity - exitFee;
 
@@ -458,8 +465,7 @@ export default {
     if (!env.BOT_STATE) {
       return json({
         ok: false,
-        error:
-          "Configure the BOT_STATE KV binding in Cloudflare."
+        error: "Configure the BOT_STATE KV binding in Cloudflare."
       }, 500);
     }
 
@@ -516,6 +522,7 @@ export default {
         await tick(env.BOT_STATE);
       } catch (error) {
         const message = errorMessage(error);
+
         console.error(
           "Scheduled paper-trading tick failed:",
           message
