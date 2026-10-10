@@ -1,0 +1,11 @@
+
+name = "crypto-paper-bot-fa"
+main = "worker.js"
+compatibility_date = "2026-10-10"
+
+[[kv_namespaces]]
+binding = "BOT_STATE"
+id = "57d982a1745243f99fe1210064da32e7"
+
+[triggers]
+crons = ["* * * * *"]
