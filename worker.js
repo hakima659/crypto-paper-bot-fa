@@ -3,20 +3,27 @@ const CONFIG = {
   initialBalance: 1000,
   tradeAmount: 100,
 
+  // Risk and profit targets
   stopLossPct: 0.005,
-  takeProfitPct: 0.10,
+  takeProfitPct: 0.012,
 
+  // Protect gains after price moves in our favor
   breakEvenTriggerPct: 0.0045,
   trailingStartPct: 0.006,
   trailingDistancePct: 0.002,
-
-  feePct: 0.001,
   breakEvenBufferPct: 0.001,
 
-  // Trade only when the bid/ask spread is at most 0.15%.
-  maxSpreadPct: 0.0015,
+  feePct: 0.001,
+
+  // A wider spread permits more tests but increases trading costs.
+  maxSpreadPct: 0.0035,
+
   minTrendStrengthPct: 0.0003,
   cooldownMinutesAfterLoss: 5,
+
+  // Exit early only after a minimum hold and bearish confirmation.
+  earlyExitMinHoldMinutes: 3,
+  earlyExitNetLossPct: 0.20,
 
   maxPrices: 100,
   maxTrades: 100
@@ -167,10 +174,39 @@ function isInCooldown(state, nowMs) {
     CONFIG.cooldownMinutesAfterLoss * 60 * 1000;
 }
 
+function hasBearishConfirmation(prices) {
+  if (prices.length < 20) return false;
+
+  const fast = average(prices, 5);
+  const slow = average(prices, 20);
+  const recent = prices.slice(-5);
+
+  if (
+    fast === null ||
+    slow === null ||
+    recent.length < 5
+  ) {
+    return false;
+  }
+
+  // Require both a bearish average relationship and
+  // a recent downward move instead of reacting to one tick.
+  const bearishTrend = fast < slow;
+  const priceBelowSlow = prices[prices.length - 1] < slow;
+  const downwardMomentum = recent[4] < recent[0];
+
+  return bearishTrend && priceBelowSlow && downwardMomentum;
+}
+
 async function tick(kv) {
-  if (!kv || typeof kv.get !== "function" ||
-      typeof kv.put !== "function") {
-    throw new Error("Configure the BOT_STATE KV binding in Cloudflare.");
+  if (
+    !kv ||
+    typeof kv.get !== "function" ||
+    typeof kv.put !== "function"
+  ) {
+    throw new Error(
+      "Configure the BOT_STATE KV binding in Cloudflare."
+    );
   }
 
   const state = await loadState(kv);
@@ -204,6 +240,7 @@ async function tick(kv) {
     const highProfit =
       (pos.highest - pos.entry) / pos.entry;
 
+    // Move the protective stop above fee-aware break-even.
     if (highProfit >= CONFIG.breakEvenTriggerPct) {
       pos.trailingStop = Math.max(
         pos.trailingStop,
@@ -212,6 +249,8 @@ async function tick(kv) {
       pos.breakEvenProtected = true;
     }
 
+    // Trail upward as the market makes new highs.
+    // The stop is never lowered.
     if (highProfit >= CONFIG.trailingStartPct) {
       pos.trailingActive = true;
       pos.trailingStop = Math.max(
@@ -220,12 +259,28 @@ async function tick(kv) {
       );
     }
 
+    const resultAtBid = estimateNet(pos, market.bid);
+    const heldMs = Date.parse(nowIso) -
+      Date.parse(pos.openedAt || nowIso);
+
+    const minimumHoldPassed =
+      Number.isFinite(heldMs) &&
+      heldMs >= CONFIG.earlyExitMinHoldMinutes * 60 * 1000;
+
+    const bearishConfirmed =
+      hasBearishConfirmation(state.prices);
+
     let reason = null;
 
-    if (market.bid <= pos.entry * (1 - CONFIG.stopLossPct)) {
+    // Emergency protection takes priority.
+    if (
+      market.bid <=
+      pos.entry * (1 - CONFIG.stopLossPct)
+    ) {
       reason = "EMERGENCY_STOP_LOSS";
     } else if (
-      market.bid >= pos.entry * (1 + CONFIG.takeProfitPct)
+      market.bid >=
+      pos.entry * (1 + CONFIG.takeProfitPct)
     ) {
       reason = "TAKE_PROFIT";
     } else if (
@@ -235,6 +290,15 @@ async function tick(kv) {
       reason = pos.trailingActive
         ? "TRAILING_STOP"
         : "BREAK_EVEN_STOP";
+    } else if (
+      minimumHoldPassed &&
+      bearishConfirmed &&
+      resultAtBid &&
+      resultAtBid.netPct <= -CONFIG.earlyExitNetLossPct
+    ) {
+      // Close only when the bearish trend is confirmed
+      // and estimated net loss has crossed the configured threshold.
+      reason = "EARLY_BEARISH_EXIT";
     }
 
     if (reason) {
@@ -298,7 +362,8 @@ async function tick(kv) {
 
       const recent = state.prices.slice(-6);
       const momentumUp =
-        recent.length === 6 && recent[5] > recent[0];
+        recent.length === 6 &&
+        recent[5] > recent[0];
 
       if (!crossedUp) {
         entryBlockReason = "NO_FRESH_UPWARD_CROSSOVER";
@@ -371,7 +436,8 @@ export default {
         mode: "PAPER",
         symbol: "BTC/IRT",
         endpoints: ["/status", "/price", "/tick"],
-        note: "Paper trading only. No real orders or wallet connection."
+        note:
+          "Paper trading only. No real orders or wallet connection."
       });
     }
 
@@ -392,7 +458,8 @@ export default {
     if (!env.BOT_STATE) {
       return json({
         ok: false,
-        error: "Configure the BOT_STATE KV binding in Cloudflare."
+        error:
+          "Configure the BOT_STATE KV binding in Cloudflare."
       }, 500);
     }
 
@@ -443,7 +510,7 @@ export default {
     ctx.waitUntil((async () => {
       try {
         if (!env.BOT_STATE) {
-          throw new Error("BOT_STATE KV binding is missing.");
+          throw new Error("BOT_STATE binding is missing.");
         }
 
         await tick(env.BOT_STATE);
