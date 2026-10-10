@@ -3,21 +3,18 @@ const CONFIG = {
   initialBalance: 1000,
   tradeAmount: 100,
 
-  // Risk controls — paper trading only
   stopLossPct: 0.005,
   takeProfitPct: 0.10,
 
-  // Profit protection
   breakEvenTriggerPct: 0.0045,
   trailingStartPct: 0.006,
   trailingDistancePct: 0.002,
   feePct: 0.001,
   breakEvenBufferPct: 0.001,
 
-  // Entry filters
   maxSpreadPct: 0.003,
   minTrendStrengthPct: 0.0003,
-  entryCooldownMinutesAfterLoss: 5,
+  cooldownMinutesAfterLoss: 5,
 
   maxPrices: 100,
   maxTrades: 100
@@ -40,21 +37,21 @@ function errorMessage(error) {
 }
 
 async function getPrice() {
-  const res = await fetch(
+  const response = await fetch(
     "https://apiv2.nobitex.ir/v3/orderbook/BTCIRT",
     { headers: { accept: "application/json" } }
   );
 
-  if (!res.ok) {
-    throw new Error(`Nobitex price request failed (${res.status})`);
+  if (!response.ok) {
+    throw new Error(`Nobitex request failed (${response.status})`);
   }
 
-  const data = await res.json();
+  const data = await response.json();
   const bid = Number(data.bids?.[0]?.[0]);
   const ask = Number(data.asks?.[0]?.[0]);
 
   if (!(bid > 0 && ask > 0) || ask < bid) {
-    throw new Error("Invalid market price from Nobitex");
+    throw new Error("Invalid BTC/IRT order book");
   }
 
   return {
@@ -66,11 +63,11 @@ async function getPrice() {
 }
 
 function average(values, period) {
+  if (values.length < period) return null;
   const sample = values.slice(-period);
-  if (sample.length < period) return null;
 
   return sample.reduce((sum, value) => sum + value, 0) /
-    sample.length;
+    period;
 }
 
 function initialState() {
@@ -89,12 +86,13 @@ function initialState() {
 async function loadState(kv) {
   const state = (await kv.get(KEY, "json")) || initialState();
 
-  // Preserve compatible data from previous versions.
   if (!Array.isArray(state.prices)) state.prices = [];
   if (!Array.isArray(state.trades)) state.trades = [];
-  if (typeof state.balance !== "number") {
+
+  if (!Number.isFinite(Number(state.balance))) {
     state.balance = CONFIG.initialBalance;
   }
+
   if (!("position" in state)) state.position = null;
   if (!("lastLossAt" in state)) state.lastLossAt = null;
 
@@ -110,7 +108,6 @@ function estimateNet(position, exitPrice) {
 
   const entry = Number(position.entry);
   const quantity = Number(position.quantity);
-
   const gross = (exitPrice - entry) * quantity;
   const entryFee = entry * quantity * CONFIG.feePct;
   const exitFee = exitPrice * quantity * CONFIG.feePct;
@@ -125,19 +122,19 @@ function estimateNet(position, exitPrice) {
   };
 }
 
-function getRiskInfo(position) {
-  if (!position) return null;
-
-  const entry = Number(position.entry);
-
-  const breakEvenStop =
-    entry *
+function feeAwareBreakEven(entry) {
+  return entry *
     ((1 + CONFIG.feePct) / (1 - CONFIG.feePct)) *
     (1 + CONFIG.breakEvenBufferPct);
+}
+
+function getRiskInfo(position) {
+  if (!position) return null;
+  const entry = Number(position.entry);
 
   return {
     emergencyStop: entry * (1 - CONFIG.stopLossPct),
-    breakEvenStop,
+    breakEvenStop: feeAwareBreakEven(entry),
     breakEvenTriggerPct: CONFIG.breakEvenTriggerPct,
     trailingStartPct: CONFIG.trailingStartPct,
     trailingDistancePct: CONFIG.trailingDistancePct,
@@ -145,22 +142,20 @@ function getRiskInfo(position) {
   };
 }
 
-function shouldPauseAfterLoss(state, nowMs) {
+function isInCooldown(state, nowMs) {
   if (!state.lastLossAt) return false;
 
   const lastLossMs = Date.parse(state.lastLossAt);
   if (!Number.isFinite(lastLossMs)) return false;
 
   return nowMs - lastLossMs <
-    CONFIG.entryCooldownMinutesAfterLoss * 60 * 1000;
+    CONFIG.cooldownMinutesAfterLoss * 60 * 1000;
 }
 
 async function tick(kv) {
   if (!kv || typeof kv.get !== "function" ||
       typeof kv.put !== "function") {
-    throw new Error(
-      "Configure the BOT_STATE KV binding in Cloudflare."
-    );
+    throw new Error("Configure the BOT_STATE KV binding in Cloudflare.");
   }
 
   const state = await loadState(kv);
@@ -168,28 +163,19 @@ async function tick(kv) {
   const now = new Date();
   const nowIso = now.toISOString();
   const nowMs = now.getTime();
-
   const previousPrices = [...state.prices];
 
   state.prices.push(market.price);
-
-  if (state.prices.length > CONFIG.maxPrices) {
-    state.prices = state.prices.slice(-CONFIG.maxPrices);
-  }
-
-  state.lastMarket = {
-    ...market,
-    time: nowIso
-  };
+  state.prices = state.prices.slice(-CONFIG.maxPrices);
+  state.lastMarket = { ...market, time: nowIso };
 
   let closedTrade = null;
   let openedTrade = false;
   let entryBlockReason = null;
 
-  const pos = state.position;
+  if (state.position) {
+    const pos = state.position;
 
-  if (pos) {
-    // Compatibility with positions from earlier versions.
     pos.entry = Number(pos.entry);
     pos.quantity = Number(pos.quantity);
     pos.highest = Math.max(
@@ -200,47 +186,18 @@ async function tick(kv) {
     pos.trailingActive = Boolean(pos.trailingActive);
     pos.breakEvenProtected = Boolean(pos.breakEvenProtected);
 
-    const highProfit =
-      (pos.highest - pos.entry) / pos.entry;
-
-    const prices = state.prices;
-    const ma5 = average(prices, 5);
-    const ma20 = average(prices, 20);
-
-    // Look for several bearish signs before an early exit.
-    const recent = prices.slice(-4);
-    let fallingMoves = 0;
-
-    for (let i = 1; i < recent.length; i++) {
-      if (recent[i] < recent[i - 1]) fallingMoves++;
-    }
-
-    const bearishReversal =
-      ma5 !== null &&
-      ma20 !== null &&
-      market.price < ma5 &&
-      ma5 < ma20 &&
-      fallingMoves >= 2;
-
-    // Fee-aware break-even protection.
-    const breakEvenStop =
-      pos.entry *
-      ((1 + CONFIG.feePct) / (1 - CONFIG.feePct)) *
-      (1 + CONFIG.breakEvenBufferPct);
+    const highProfit = (pos.highest - pos.entry) / pos.entry;
 
     if (highProfit >= CONFIG.breakEvenTriggerPct) {
       pos.trailingStop = Math.max(
         pos.trailingStop,
-        breakEvenStop
+        feeAwareBreakEven(pos.entry)
       );
-
       pos.breakEvenProtected = true;
     }
 
-    // Trail the highest observed BID once price has risen enough.
     if (highProfit >= CONFIG.trailingStartPct) {
       pos.trailingActive = true;
-
       pos.trailingStop = Math.max(
         pos.trailingStop,
         pos.highest * (1 - CONFIG.trailingDistancePct)
@@ -249,6 +206,7 @@ async function tick(kv) {
 
     let reason = null;
 
+    // Emergency risk protection remains active.
     if (market.bid <= pos.entry * (1 - CONFIG.stopLossPct)) {
       reason = "EMERGENCY_STOP_LOSS";
     } else if (
@@ -262,16 +220,14 @@ async function tick(kv) {
       reason = pos.trailingActive
         ? "TRAILING_STOP"
         : "BREAK_EVEN_STOP";
-    } else if (bearishReversal) {
-      reason = "EARLY_TREND_REVERSAL";
     }
 
+    // No exit solely because of a short-lived trend reversal.
     if (reason) {
       const exitPrice = market.bid;
       const result = estimateNet(pos, exitPrice);
       const exitFee = exitPrice * pos.quantity * CONFIG.feePct;
 
-      // Entry principal and entry fee were deducted at entry.
       state.balance += exitPrice * pos.quantity - exitFee;
 
       closedTrade = {
@@ -288,10 +244,7 @@ async function tick(kv) {
       };
 
       state.trades.push(closedTrade);
-
-      if (state.trades.length > CONFIG.maxTrades) {
-        state.trades = state.trades.slice(-CONFIG.maxTrades);
-      }
+      state.trades = state.trades.slice(-CONFIG.maxTrades);
 
       if (result.net < 0) {
         state.lastLossAt = nowIso;
@@ -299,78 +252,73 @@ async function tick(kv) {
 
       state.position = null;
     }
-  } else if (state.prices.length >= 21) {
-    const previousFast = average(previousPrices, 5);
-    const previousSlow = average(previousPrices, 20);
-    const currentFast = average(state.prices, 5);
-    const currentSlow = average(state.prices, 20);
+  } else {
+    if (state.prices.length < 21 || previousPrices.length < 20) {
+      entryBlockReason = "COLLECTING_PRICE_SAMPLES";
+    } else if (isInCooldown(state, nowMs)) {
+      entryBlockReason = "COOLDOWN_AFTER_LOSS";
+    } else if (market.spreadPct > CONFIG.maxSpreadPct) {
+      entryBlockReason = "SPREAD_TOO_HIGH";
+    } else {
+      const previousFast = average(previousPrices, 5);
+      const previousSlow = average(previousPrices, 20);
+      const currentFast = average(state.prices, 5);
+      const currentSlow = average(state.prices, 20);
 
-    // Require a fresh upward crossover.
-    const crossedUp =
-      previousFast !== null &&
-      previousSlow !== null &&
-      currentFast !== null &&
-      currentSlow !== null &&
-      previousFast <= previousSlow &&
-      currentFast > currentSlow;
+      const crossedUp =
+        previousFast !== null &&
+        previousSlow !== null &&
+        currentFast !== null &&
+        currentSlow !== null &&
+        previousFast <= previousSlow &&
+        currentFast > currentSlow;
 
-    const trendStrength =
-      currentSlow > 0
+      const trendStrength = currentSlow > 0
         ? (currentFast - currentSlow) / currentSlow
         : 0;
 
-    const momentumPrices = state.prices.slice(-6);
+      const recent = state.prices.slice(-6);
+      const momentumUp =
+        recent.length === 6 && recent[5] > recent[0];
 
-    const momentumUp =
-      momentumPrices.length >= 6 &&
-      momentumPrices[momentumPrices.length - 1] >
-        momentumPrices[0];
-
-    const spreadOk = market.spreadPct <= CONFIG.maxSpreadPct;
-    const trendOk = trendStrength >= CONFIG.minTrendStrengthPct;
-    const cooldown = shouldPauseAfterLoss(state, nowMs);
-
-    if (cooldown) {
-      entryBlockReason = "COOLDOWN_AFTER_LOSS";
-    } else if (!spreadOk) {
-      entryBlockReason = "SPREAD_TOO_HIGH";
-    } else if (!crossedUp) {
-      entryBlockReason = "NO_CONFIRMED_UPWARD_CROSSOVER";
-    } else if (!trendOk || !momentumUp) {
-      entryBlockReason = "TREND_OR_MOMENTUM_NOT_CONFIRMED";
-    } else {
-      // A long entry pays the ASK price.
-      const entryPrice = market.ask;
-      const cost = CONFIG.tradeAmount;
-      const entryFee = cost * CONFIG.feePct;
-
-      if (state.balance >= cost + entryFee) {
-        const quantity = cost / entryPrice;
-
-        state.balance -= cost + entryFee;
-
-        state.position = {
-          entry: entryPrice,
-          quantity,
-          highest: market.bid,
-          trailingActive: false,
-          trailingStop: 0,
-          breakEvenProtected: false,
-          openedAt: nowIso
-        };
-
-        openedTrade = true;
+      if (!crossedUp) {
+        entryBlockReason = "NO_FRESH_UPWARD_CROSSOVER";
+      } else if (
+        trendStrength < CONFIG.minTrendStrengthPct ||
+        !momentumUp ||
+        market.price <= currentSlow
+      ) {
+        entryBlockReason = "TREND_NOT_CONFIRMED";
       } else {
-        entryBlockReason = "INSUFFICIENT_BALANCE";
+        const cost = CONFIG.tradeAmount;
+        const entryFee = cost * CONFIG.feePct;
+
+        if (state.balance < cost + entryFee) {
+          entryBlockReason = "INSUFFICIENT_BALANCE";
+        } else {
+          const entryPrice = market.ask;
+          const quantity = cost / entryPrice;
+
+          state.balance -= cost + entryFee;
+
+          state.position = {
+            entry: entryPrice,
+            quantity,
+            highest: market.bid,
+            trailingActive: false,
+            trailingStop: 0,
+            breakEvenProtected: false,
+            openedAt: nowIso
+          };
+
+          openedTrade = true;
+        }
       }
     }
-  } else {
-    entryBlockReason = "COLLECTING_PRICE_SAMPLES";
   }
 
   state.lastUpdate = nowIso;
   state.lastError = null;
-
   await saveState(kv, state);
 
   return {
@@ -409,15 +357,9 @@ export default {
 
     if (url.pathname === "/price") {
       try {
-        return json({
-          ok: true,
-          ...(await getPrice())
-        });
+        return json({ ok: true, ...(await getPrice()) });
       } catch (error) {
-        return json({
-          ok: false,
-          error: errorMessage(error)
-        }, 502);
+        return json({ ok: false, error: errorMessage(error) }, 502);
       }
     }
 
@@ -450,10 +392,7 @@ export default {
           lastError: state.lastError
         });
       } catch (error) {
-        return json({
-          ok: false,
-          error: errorMessage(error)
-        }, 500);
+        return json({ ok: false, error: errorMessage(error) }, 500);
       }
     }
 
@@ -461,17 +400,11 @@ export default {
       try {
         return json(await tick(env.BOT_STATE));
       } catch (error) {
-        return json({
-          ok: false,
-          error: errorMessage(error)
-        }, 502);
+        return json({ ok: false, error: errorMessage(error) }, 502);
       }
     }
 
-    return json({
-      ok: false,
-      error: "Not found"
-    }, 404);
+    return json({ ok: false, error: "Not found" }, 404);
   },
 
   async scheduled(controller, env, ctx) {
@@ -484,11 +417,7 @@ export default {
         await tick(env.BOT_STATE);
       } catch (error) {
         const message = errorMessage(error);
-
-        console.error(
-          "Scheduled paper-trading tick failed:",
-          message
-        );
+        console.error("Scheduled paper-trading tick failed:", message);
 
         if (env.BOT_STATE) {
           try {
