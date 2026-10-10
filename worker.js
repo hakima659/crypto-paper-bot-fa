@@ -9,10 +9,12 @@ const CONFIG = {
   breakEvenTriggerPct: 0.0045,
   trailingStartPct: 0.006,
   trailingDistancePct: 0.002,
+
   feePct: 0.001,
   breakEvenBufferPct: 0.001,
 
-  maxSpreadPct: 0.003,
+  // Trade only when the bid/ask spread is at most 0.15%.
+  maxSpreadPct: 0.0015,
   minTrendStrengthPct: 0.0003,
   cooldownMinutesAfterLoss: 5,
 
@@ -54,16 +56,19 @@ async function getPrice() {
     throw new Error("Invalid BTC/IRT order book");
   }
 
+  const price = (bid + ask) / 2;
+
   return {
     bid,
     ask,
-    price: (bid + ask) / 2,
-    spreadPct: (ask - bid) / ((ask + bid) / 2)
+    price,
+    spreadPct: (ask - bid) / price
   };
 }
 
 function average(values, period) {
   if (values.length < period) return null;
+
   const sample = values.slice(-period);
 
   return sample.reduce((sum, value) => sum + value, 0) /
@@ -84,17 +89,24 @@ function initialState() {
 }
 
 async function loadState(kv) {
-  const state = (await kv.get(KEY, "json")) || initialState();
+  const saved = await kv.get(KEY, "json");
+  const state = saved || initialState();
 
   if (!Array.isArray(state.prices)) state.prices = [];
   if (!Array.isArray(state.trades)) state.trades = [];
 
-  if (!Number.isFinite(Number(state.balance))) {
+  if (
+    typeof state.balance !== "number" ||
+    !Number.isFinite(state.balance)
+  ) {
     state.balance = CONFIG.initialBalance;
   }
 
   if (!("position" in state)) state.position = null;
   if (!("lastLossAt" in state)) state.lastLossAt = null;
+  if (!("lastUpdate" in state)) state.lastUpdate = null;
+  if (!("lastError" in state)) state.lastError = null;
+  if (!("lastMarket" in state)) state.lastMarket = null;
 
   return state;
 }
@@ -108,17 +120,19 @@ function estimateNet(position, exitPrice) {
 
   const entry = Number(position.entry);
   const quantity = Number(position.quantity);
+
   const gross = (exitPrice - entry) * quantity;
   const entryFee = entry * quantity * CONFIG.feePct;
   const exitFee = exitPrice * quantity * CONFIG.feePct;
-  const net = gross - entryFee - exitFee;
+  const fees = entryFee + exitFee;
+  const net = gross - fees;
   const notional = entry * quantity;
 
   return {
     gross,
-    fees: entryFee + exitFee,
+    fees,
     net,
-    netPct: notional > 0 ? (net / notional) * 100 : 0
+    netPct: notional > 0 ? net / notional * 100 : 0
   };
 }
 
@@ -130,6 +144,7 @@ function feeAwareBreakEven(entry) {
 
 function getRiskInfo(position) {
   if (!position) return null;
+
   const entry = Number(position.entry);
 
   return {
@@ -186,7 +201,8 @@ async function tick(kv) {
     pos.trailingActive = Boolean(pos.trailingActive);
     pos.breakEvenProtected = Boolean(pos.breakEvenProtected);
 
-    const highProfit = (pos.highest - pos.entry) / pos.entry;
+    const highProfit =
+      (pos.highest - pos.entry) / pos.entry;
 
     if (highProfit >= CONFIG.breakEvenTriggerPct) {
       pos.trailingStop = Math.max(
@@ -206,7 +222,6 @@ async function tick(kv) {
 
     let reason = null;
 
-    // Emergency risk protection remains active.
     if (market.bid <= pos.entry * (1 - CONFIG.stopLossPct)) {
       reason = "EMERGENCY_STOP_LOSS";
     } else if (
@@ -222,13 +237,14 @@ async function tick(kv) {
         : "BREAK_EVEN_STOP";
     }
 
-    // No exit solely because of a short-lived trend reversal.
     if (reason) {
       const exitPrice = market.bid;
       const result = estimateNet(pos, exitPrice);
-      const exitFee = exitPrice * pos.quantity * CONFIG.feePct;
+      const exitFee =
+        exitPrice * pos.quantity * CONFIG.feePct;
 
-      state.balance += exitPrice * pos.quantity - exitFee;
+      state.balance +=
+        exitPrice * pos.quantity - exitFee;
 
       closedTrade = {
         entry: pos.entry,
@@ -253,7 +269,10 @@ async function tick(kv) {
       state.position = null;
     }
   } else {
-    if (state.prices.length < 21 || previousPrices.length < 20) {
+    if (
+      state.prices.length < 21 ||
+      previousPrices.length < 20
+    ) {
       entryBlockReason = "COLLECTING_PRICE_SAMPLES";
     } else if (isInCooldown(state, nowMs)) {
       entryBlockReason = "COOLDOWN_AFTER_LOSS";
@@ -319,6 +338,7 @@ async function tick(kv) {
 
   state.lastUpdate = nowIso;
   state.lastError = null;
+
   await saveState(kv, state);
 
   return {
@@ -357,9 +377,15 @@ export default {
 
     if (url.pathname === "/price") {
       try {
-        return json({ ok: true, ...(await getPrice()) });
+        return json({
+          ok: true,
+          ...(await getPrice())
+        });
       } catch (error) {
-        return json({ ok: false, error: errorMessage(error) }, 502);
+        return json({
+          ok: false,
+          error: errorMessage(error)
+        }, 502);
       }
     }
 
@@ -392,7 +418,10 @@ export default {
           lastError: state.lastError
         });
       } catch (error) {
-        return json({ ok: false, error: errorMessage(error) }, 500);
+        return json({
+          ok: false,
+          error: errorMessage(error)
+        }, 500);
       }
     }
 
@@ -400,7 +429,10 @@ export default {
       try {
         return json(await tick(env.BOT_STATE));
       } catch (error) {
-        return json({ ok: false, error: errorMessage(error) }, 502);
+        return json({
+          ok: false,
+          error: errorMessage(error)
+        }, 502);
       }
     }
 
@@ -417,7 +449,10 @@ export default {
         await tick(env.BOT_STATE);
       } catch (error) {
         const message = errorMessage(error);
-        console.error("Scheduled paper-trading tick failed:", message);
+        console.error(
+          "Scheduled paper-trading tick failed:",
+          message
+        );
 
         if (env.BOT_STATE) {
           try {
